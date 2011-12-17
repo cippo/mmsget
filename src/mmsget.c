@@ -5,200 +5,65 @@
 #include <errno.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <sys/time.h>
 #include <libmms/mmsx.h>
+#include "fifo.h"
+#include "print.h"
 
-#define THREAD_COUNT 10
+#define THREAD_COUNT 50
 #define BANDWIDTH    INT_MAX
-#define BUF_SIZE     (12 * 1024)
-
-typedef struct buf_St {
-	char data[BUF_SIZE];
-	int  len;
-	mms_off_t off;
-
-	struct buf_St *next;
-} buf_t;
+#define BUF_SIZE     (16 * 1024)
 
 typedef struct {
-	buf_t *root;
-	pthread_mutex_t lock;
-	pthread_cond_t  cond;
-	pthread_cond_t  empty_cond;
-} buf_list_t;
+	char data[BUF_SIZE];
+	uint32_t len, off;
+} buf_t;
 
-buf_list_t dirty_bufs = {
-	.root = NULL,
-	.lock = PTHREAD_MUTEX_INITIALIZER,
-	.cond = PTHREAD_COND_INITIALIZER,
-	.empty_cond = PTHREAD_COND_INITIALIZER,
-};
-buf_list_t clean_bufs = {
-	.root = NULL,
-	.lock = PTHREAD_MUTEX_INITIALIZER,
-	.cond = PTHREAD_COND_INITIALIZER,
-	.empty_cond = PTHREAD_COND_INITIALIZER,
-};
-uint32_t file_len;
+fifo_t dirty_bufs = FIFO_INITIALIZER;
+fifo_t clean_bufs = FIFO_INITIALIZER;
 
-static void
-add_buf (buf_t *buf, buf_list_t *list)
-{
-	pthread_mutex_lock (&list->lock);
+#define add_dirty_buf(b) fifo_push (&dirty_bufs, b)
+#define add_clean_buf(b) fifo_push (&clean_bufs, b)
+#define get_dirty_buf()  fifo_pop  (&dirty_bufs)
+#define get_clean_buf()  fifo_pop  (&clean_bufs)
 
-	buf->next = list->root;
-	list->root = buf;
-
-	pthread_cond_signal (&list->cond);
-	pthread_mutex_unlock (&list->lock);
-}
-
-static buf_t*
-get_buf (buf_list_t *list)
-{
-	buf_t *ret;
-
-	pthread_mutex_lock (&list->lock);
-
-	while (list->root == NULL) {
-		pthread_cond_wait (&list->cond, &list->lock);
-	}
-
-	ret = list->root;
-	list->root = ret->next;
-
-	if (list->root == NULL) {
-		pthread_cond_signal (&list->empty_cond);
-	}
-
-	pthread_mutex_unlock (&list->lock);
-
-	return ret;
-}
-
-static void
-wait_for_empty (buf_list_t *list)
-{
-	pthread_mutex_lock (&list->lock);
-
-	while (list->root != NULL) {
-		pthread_cond_wait (&list->empty_cond, &list->lock);
-	}
-
-	pthread_mutex_unlock (&list->lock);
-}
-
-#define add_dirty_buf(b) add_buf (b, &dirty_bufs)
-#define add_clean_buf(b) add_buf (b, &clean_bufs)
-#define get_dirty_buf() get_buf (&dirty_bufs)
-#define get_clean_buf() get_buf (&clean_bufs)
-
-
-static double
-timeval_diff (struct timeval *a, struct timeval *b)
-{
-	return (double)(b->tv_sec - a->tv_sec) +
-		(double)(b->tv_usec - a->tv_usec) / 1e6;
-}
-
-static void
-print_bytes (uint32_t bytes)
-{
-	if (bytes >= (1024*1024)) {
-		printf ("%#5.4gMiB", ((double)bytes) / (1024.0*1024.0));
-	} else if (bytes >= 1024) {
-		printf ("%#5.4gKiB", ((double)bytes) / 1024.0);
-	} else {
-		printf ("%#5.4g  B", ((double)bytes));
-	}
-}
-
-static void
-update_progress ()
-{
-	static struct timeval times[THREAD_COUNT * 2];
-	static int count = 0;
-	static int time = 0;
-
-	double bytes;
-	double secs;
-	uint64_t done = count * BUF_SIZE;
-	int progress = done * 50 / file_len;
-
-	if ((count % 10) == 0) {
-		gettimeofday (times + time, NULL);
-		time = (time + 1) % (THREAD_COUNT * 2);
-	}
-
-	if ((count / 10) < (THREAD_COUNT * 2)) {
-		secs = timeval_diff (times, times + ((time - 1) % (THREAD_COUNT * 2)));
-		bytes = BUF_SIZE * 10 * (time - 1);
-	} else {
-		secs = timeval_diff (times + time, times + ((time - 1) % (THREAD_COUNT * 2)));
-		bytes = BUF_SIZE * 10 * THREAD_COUNT * 2;
-	}
-
-	/* Print progress bar */
-	printf ("\r[");
-	for (int i = 0; i < 50; i++) {
-		if (i < progress) {
-			printf ("=");
-		} else {
-			printf ("-");
-		}
-	}
-	printf ("]");
-
-	switch ((count / 4) % 4) {
-	case 0:
-		printf (" - ");
-		break;
-	case 1:
-		printf (" \\ ");
-		break;
-	case 2:
-		printf (" | ");
-		break;
-	case 3:
-		printf (" / ");
-	}
-
-	print_bytes (done);
-	printf (" of ");
-	print_bytes (file_len);
-	printf (" at ");
-
-	print_bytes (bytes/secs);
-	printf("/s");
-	fflush (stdout);
-
-	count++;
-}
+typedef struct {
+	uint32_t len;
+	FILE *file;
+	const char *filename;
+} write_info_t;
 
 static void *
 write_thread (void *arg)
 {
-	FILE *file = arg;
-	printf ("\n");
+	write_info_t *info = arg;
+	uint32_t bytes_transfered = 0;
 
-	update_progress ();
+	print_progress (info->filename, 0, info->len);
 
 	while (1) {
 		buf_t *buf = get_dirty_buf ();
 
-		fseek (file, buf->off, SEEK_SET);
-		fwrite (buf->data, 1, buf->len, file);
+		/* If buf is NULL main called fifo_signal, it's time ot quit */
+		if (buf == NULL)
+			break;
+
+		fseek (info->file, buf->off, SEEK_SET);
+		fwrite (buf->data, 1, buf->len, info->file);
+
+		bytes_transfered += buf->len;
+		print_progress (info->filename, bytes_transfered, info->len);
 
 		add_clean_buf (buf);
-
-		update_progress ();
 	}
+
+	print_progress (info->filename, info->len, info->len);
 
 	return NULL;
 }
 
 typedef struct {
-	int id;
 	uint32_t start, len;
 	const char *url;
 } download_info_t;
@@ -214,7 +79,7 @@ seek (mmsx_t *conn, uint32_t pos)
 
 	if (off != pos) {
 		/* TODO: Implement binary search with mmsx_time_seek */
-		fprintf (stderr, "mmsx_seek not supported\n");
+		print_error ("mmsx_seek not supported\n");
 
 		while (off < pos) {
 			mms_off_t left = pos - off;
@@ -234,7 +99,7 @@ download_thread (void *arg)
 	conn = mmsx_connect (NULL, NULL, info->url, BANDWIDTH);
 
 	if (conn == NULL) {
-		fprintf (stderr, "Could not open %s\n", info->url);
+		print_error ("Could not open %s\n", info->url);
 		pthread_exit (NULL);
 	}
 
@@ -244,8 +109,11 @@ download_thread (void *arg)
 		int bytes_read;
 		buf_t *buf = get_clean_buf ();
 
-		bytes_read  = mmsx_read (NULL, conn, buf->data,
+		bytes_read = mmsx_read (NULL, conn, buf->data,
 				left < BUF_SIZE ? left : BUF_SIZE);
+
+		if (bytes_read == 0) break;
+
 		buf->off = pos;
 		buf->len = bytes_read;
 
@@ -261,55 +129,77 @@ download_thread (void *arg)
 	return NULL;
 }
 
-int
-main (int argc, char *argv[])
+/* Tries to connect to the stream to retrieve some information about it
+ * Returns true on success, false on error.
+ */
+static bool
+mmsx_get_info (const char *url, uint32_t *len, bool *seekable)
 {
-	const char *url = argv[1];
-	const char *filename = "test.wmv";
-	FILE *file;
 	mmsx_t *mmsx;
-	pthread_t threads[THREAD_COUNT + 1];
-	uint32_t len_per_thread;
 
-	file = fopen (filename, "w");
-
-	if (file == NULL) {
-		fprintf (stderr, "Could not open %s - %s\n",
-				filename,
-				strerror (errno));
-	}
-
-	for (int i = 0; i < 2 * THREAD_COUNT; i++) {
-		add_clean_buf (malloc (sizeof (buf_t)));
-	}
-
-	printf ("Connecting to %s...\n", url);
+	print_info (1, "Connecting to %s...\n", url);
 
 	mmsx = mmsx_connect (NULL, NULL, url, BANDWIDTH);
 
 	if (mmsx == NULL) {
-		fprintf (stderr, "Could not connect to %s\n", url);
-		return 1;
+		print_error ("Could not connect to %s\n", url);
+		return false;
 	}
 
-	file_len = mmsx_get_length (mmsx);
+	*len      = mmsx_get_length (mmsx);
+	*seekable = mmsx_get_seekable (mmsx);
+
 	mmsx_close (mmsx);
 
-	ftruncate (fileno (file), file_len);
+	return true;
+}
 
-	len_per_thread = (file_len + THREAD_COUNT - 1) / THREAD_COUNT;
+static bool
+download (const char *url, const char *filename, int thread_count)
+{
+	FILE *file;
+	uint32_t len, len_per_thread;
+	bool seekable;
+	pthread_t threads[thread_count + 1];
+	write_info_t write_info;
 
-	printf ("Connected\nUsing %i threads\n", THREAD_COUNT);
+	if (!mmsx_get_info (url, &len, &seekable))
+		return false;
 
-	for (int i = 0; i < THREAD_COUNT; i++) {
+	if (!seekable) {
+		print_error ("Stream is not seekable, using a single thread\n");
+		thread_count = 1;
+		/* TODO: Find out if len is correct in this case */
+	}
+
+	if (!(file = fopen (filename, "w"))) {
+		print_error ("Could not open %s - %s\n",
+				filename,
+				strerror (errno));
+		return false;
+	}
+
+	if (ftruncate (fileno (file), len)) {
+		print_error ("ftruncate failed %s\n",
+				strerror (errno));
+		return false;
+	}
+
+	print_info (1, "Starting download\nUsing %i threads\n", thread_count);
+
+	/* Get the amount of data each thread should download (rounded up) */
+	len_per_thread = (len + (thread_count - 1)) / thread_count;
+
+	/* Create the threads that will do the downloading */
+	for (int i = 0; i < thread_count; i++) {
 		download_info_t *info = malloc (sizeof (download_info_t));
 
-		info->id = i;
 		info->url = url;
 		info->start = len_per_thread * i;
 
-		if (i == THREAD_COUNT - 1) {
-			info->len = file_len - len_per_thread * (THREAD_COUNT - 1);
+		/* The last thread might have less data to download */
+		if (i == thread_count - 1) {
+			info->len = len - len_per_thread * (thread_count - 1);
 		} else {
 			info->len = len_per_thread;
 		}
@@ -317,20 +207,40 @@ main (int argc, char *argv[])
 		pthread_create (threads + i, NULL, download_thread, info);
 	}
 
-	pthread_create (threads + THREAD_COUNT, NULL, write_thread, file);
+	/* Create the thread that writes the data to file */
+	write_info.file = file;
+	write_info.len  = len;
+	write_info.filename = filename;
+	pthread_create (threads + thread_count, NULL, write_thread, &write_info);
 
-	for (int i = 0; i < THREAD_COUNT; i++) {
+	/* Wait for the download threads to finish */
+	for (int i = 0; i < thread_count; i++) {
 		pthread_join (threads[i], NULL);
 	}
 
-	wait_for_empty (&dirty_bufs);
-
-	pthread_cancel (threads[THREAD_COUNT]);
-	pthread_join (threads[THREAD_COUNT], NULL);
+	/* Wait for the write thread to write all the dirty data */
+	fifo_signal (&dirty_bufs);
+	pthread_join (threads[thread_count], NULL);
 
 	fclose (file);
 
-	printf ("\nDownload complete\n");
+	print_info (1, "\nDownload complete\n");
+
+	return true;
+}
+
+int
+main (int argc, char *argv[])
+{
+	const char *url = argv[1];
+	const char *filename = "test.wmv";
+
+	for (int i = 0; i < 2 * THREAD_COUNT; i++) {
+		add_clean_buf (malloc (sizeof (buf_t)));
+	}
+
+	if (!download (url, filename, THREAD_COUNT))
+		return 1;
 
 	return 0;
 }
