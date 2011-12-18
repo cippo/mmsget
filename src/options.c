@@ -18,6 +18,7 @@
  */
 
 #include "options.h"
+#include "config.h"
 #include <string.h>
 #include <stdlib.h>
 #include <getopt.h>
@@ -58,11 +59,12 @@ print_usage (const char *prog)
 static void
 print_version ()
 {
-	printf ("mmsget - 0.1\n"
+	printf ("mmsget - %s\n"
 			"Copyright (C) 2011 Sivert Berg\n\n"
 			"License GPLv3: GNU GPL version 3 <http://gnu.org/licenses/gpl.html>.\n"
 			"This is free software: you are free to change and redistribute it.\n"
-			"There is NO WARRANTY, to the extent permitted by law.\n"
+			"There is NO WARRANTY, to the extent permitted by law.\n",
+			VERSION
 		   );
 }
 
