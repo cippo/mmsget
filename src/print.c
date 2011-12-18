@@ -63,6 +63,7 @@ print_error (const char *fmt, ...)
 	va_list ap;
 
 	va_start (ap, fmt);
+	fprintf (stderr, "ERROR: ");
 	vfprintf (stderr, fmt, ap);
 	va_end (ap);
 }

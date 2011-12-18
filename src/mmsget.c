@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
 #include <pthread.h>
 #include <errno.h>
 #include <string.h>
@@ -10,9 +9,8 @@
 #include <libmms/mmsx.h>
 #include "fifo.h"
 #include "print.h"
+#include "options.h"
 
-#define THREAD_COUNT 50
-#define BANDWIDTH    INT_MAX
 #define BUF_SIZE     (16 * 1024)
 
 typedef struct {
@@ -32,6 +30,7 @@ typedef struct {
 	uint32_t len;
 	FILE *file;
 	const char *filename;
+	bool progress_bar;
 } write_info_t;
 
 static void *
@@ -40,7 +39,8 @@ write_thread (void *arg)
 	write_info_t *info = arg;
 	uint32_t bytes_transfered = 0;
 
-	print_progress (info->filename, 0, info->len);
+	if (info->progress_bar)
+		print_progress (info->filename, 0, info->len);
 
 	while (1) {
 		buf_t *buf = get_dirty_buf ();
@@ -53,7 +53,8 @@ write_thread (void *arg)
 		fwrite (buf->data, 1, buf->len, info->file);
 
 		bytes_transfered += buf->len;
-		print_progress (info->filename, bytes_transfered, info->len);
+		if (info->progress_bar)
+			print_progress (info->filename, bytes_transfered, info->len);
 
 		add_clean_buf (buf);
 	}
@@ -65,7 +66,9 @@ write_thread (void *arg)
 
 typedef struct {
 	uint32_t start, len;
+	int bandwidth;
 	const char *url;
+	bool finished;
 } download_info_t;
 
 
@@ -83,7 +86,13 @@ seek (mmsx_t *conn, uint32_t pos)
 
 		while (off < pos) {
 			mms_off_t left = pos - off;
-			mmsx_read (NULL, conn, seek_buf, left > BUF_SIZE ? BUF_SIZE : left);
+			int data_read  = mmsx_read (NULL, conn, seek_buf, left > BUF_SIZE ? BUF_SIZE : left);
+
+			/* At the end of the stream, can not seek any further */
+			if (data_read == 0)
+				break;
+
+			pos += data_read;
 		}
 	}
 }
@@ -96,10 +105,11 @@ download_thread (void *arg)
 	uint32_t left = info->len;
 	mmsx_t *conn;
 
-	conn = mmsx_connect (NULL, NULL, info->url, BANDWIDTH);
+	conn = mmsx_connect (NULL, NULL, info->url, info->bandwidth);
 
 	if (conn == NULL) {
 		print_error ("Could not open %s\n", info->url);
+		info->finished = false;
 		pthread_exit (NULL);
 	}
 
@@ -124,7 +134,8 @@ download_thread (void *arg)
 	}
 
 	mmsx_close (conn);
-	free (info);
+
+	info->finished = true;
 
 	return NULL;
 }
@@ -133,13 +144,13 @@ download_thread (void *arg)
  * Returns true on success, false on error.
  */
 static bool
-mmsx_get_info (const char *url, uint32_t *len, bool *seekable)
+mmsx_get_info (const char *url, uint32_t *len, bool *seekable, int bandwidth)
 {
 	mmsx_t *mmsx;
 
 	print_info (1, "Connecting to %s...\n", url);
 
-	mmsx = mmsx_connect (NULL, NULL, url, BANDWIDTH);
+	mmsx = mmsx_connect (NULL, NULL, url, bandwidth);
 
 	if (mmsx == NULL) {
 		print_error ("Could not connect to %s\n", url);
@@ -149,21 +160,28 @@ mmsx_get_info (const char *url, uint32_t *len, bool *seekable)
 	*len      = mmsx_get_length (mmsx);
 	*seekable = mmsx_get_seekable (mmsx);
 
+	print_info (2, "Stream length:   %i bytes\n"
+	               "Stream seekable: %s\n",
+	               len, seekable ? "true" : "false");
+
 	mmsx_close (mmsx);
 
 	return true;
 }
 
 static bool
-download (const char *url, const char *filename, int thread_count)
+download (options_t *options)
 {
 	FILE *file;
 	uint32_t len, len_per_thread;
 	bool seekable;
+	int thread_count = options->thread_count;
 	pthread_t threads[thread_count + 1];
+	download_info_t download_infos[thread_count];
 	write_info_t write_info;
+	int remaining;
 
-	if (!mmsx_get_info (url, &len, &seekable))
+	if (!mmsx_get_info (options->url, &len, &seekable, options->bandwidth))
 		return false;
 
 	if (!seekable) {
@@ -172,9 +190,9 @@ download (const char *url, const char *filename, int thread_count)
 		/* TODO: Find out if len is correct in this case */
 	}
 
-	if (!(file = fopen (filename, "w"))) {
+	if (!(file = fopen (options->filename, "w"))) {
 		print_error ("Could not open %s - %s\n",
-				filename,
+				options->filename,
 				strerror (errno));
 		return false;
 	}
@@ -190,12 +208,14 @@ download (const char *url, const char *filename, int thread_count)
 	/* Get the amount of data each thread should download (rounded up) */
 	len_per_thread = (len + (thread_count - 1)) / thread_count;
 
-	/* Create the threads that will do the downloading */
+	/* Fill in the info structures for the download threads */
 	for (int i = 0; i < thread_count; i++) {
-		download_info_t *info = malloc (sizeof (download_info_t));
+		download_info_t *info = download_infos + i;
 
-		info->url = url;
-		info->start = len_per_thread * i;
+		info->bandwidth = options->bandwidth;
+		info->url       = options->url;
+		info->start     = len_per_thread * i;
+		info->finished  = false;
 
 		/* The last thread might have less data to download */
 		if (i == thread_count - 1) {
@@ -203,20 +223,42 @@ download (const char *url, const char *filename, int thread_count)
 		} else {
 			info->len = len_per_thread;
 		}
-
-		pthread_create (threads + i, NULL, download_thread, info);
 	}
 
 	/* Create the thread that writes the data to file */
 	write_info.file = file;
 	write_info.len  = len;
-	write_info.filename = filename;
+	write_info.filename     = options->filename;
+	write_info.progress_bar = options->progress_bar;
 	pthread_create (threads + thread_count, NULL, write_thread, &write_info);
 
-	/* Wait for the download threads to finish */
-	for (int i = 0; i < thread_count; i++) {
-		pthread_join (threads[i], NULL);
-	}
+	do {
+		/* Start the remaining threads */
+		for (int i = 0; i < thread_count; i++) {
+			if (!download_infos[i].finished)
+				pthread_create (threads + i, NULL, download_thread, download_infos + i);
+		}
+
+		remaining = thread_count;
+
+		/* Wait for the download threads to finish */
+		for (int i = 0; i < thread_count; i++) {
+			if (!download_infos[i].finished)
+				pthread_join (threads[i], NULL);
+
+			if (download_infos[i].finished)
+				remaining--;
+		}
+
+		if (remaining == thread_count) {
+			print_error ("All download threads failed\n");
+			break;
+		} else if (remaining > 0) {
+			print_info (1, "%i threads did not finish, restarting them\n"
+			               "Try lowering the number of threads\n", remaining);
+		}
+	} while (remaining > 0);
+
 
 	/* Wait for the write thread to write all the dirty data */
 	fifo_signal (&dirty_bufs);
@@ -232,14 +274,18 @@ download (const char *url, const char *filename, int thread_count)
 int
 main (int argc, char *argv[])
 {
-	const char *url = argv[1];
-	const char *filename = "test.wmv";
+	options_t options;
 
-	for (int i = 0; i < 2 * THREAD_COUNT; i++) {
+	if (!options_parse (argc, argv, &options))
+		return 1;
+
+	print_set_verbosity_level (options.verbosity_level);
+
+	for (int i = 0; i < 2 * options.thread_count; i++) {
 		add_clean_buf (malloc (sizeof (buf_t)));
 	}
 
-	if (!download (url, filename, THREAD_COUNT))
+	if (!download (&options))
 		return 1;
 
 	return 0;
